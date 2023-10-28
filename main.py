@@ -12,30 +12,69 @@ from newspaper import Article
 from trafilatura import fetch_url, extract
 import xml.etree.ElementTree as ET
 import feedparser
-import fitz
-import io
-from PIL import Image
+from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api.formatters import TextFormatter
+from newspaper import Article
+import re
+from typing import List  # Import the List type hint
 
 nest_asyncio.apply()
 # Set up the LLM model
 llm: LLM = G4FLLM(
     model=models.gpt_35_turbo,
-    provider=Provider.FreeGpt,
+    provider=Provider.GeekGpt,
 )
+
+
+def extract_youtube_video_id(url):
+    # Extract the YouTube video ID from the URL
+    video_id = None
+
+    if "youtu.be" in url:
+        # For short youtu.be URLs
+        video_id = url.split("/")[-1].split("?")[0]
+    else:
+        # For standard YouTube URLs
+        match = re.search(r"([A-Za-z0-9_-]{11})", url)
+        if match:
+            video_id = match.group(1)
+
+    return video_id
+
 
 async def get_youtube_transcript(video_url):
     # extract youtube transcript from the video
-    
+    video_id = extract_youtube_video_id(video_url)
+    print(video_id)
+    transcript = YouTubeTranscriptApi.get_transcript(video_id)
+    formatter = TextFormatter()
+    plain_text = formatter.format_transcript(transcript)
+    return plain_text
 
-#! FIX FINISH
+
 async def extract_best_image_from_page(page_url):
-    # somehow extract best image of the article or info from the page
+    try:
+        article = Article(page_url)
+        article.download()
+        article.parse()
+
+        # Get the main image URL
+        best_image_url = article.top_image
+        if best_image_url:
+            return best_image_url
+
+    except Exception as e:
+        print(f"Error extracting the best image from the page: {str(e)}")
+
+    # Return None if no suitable image is found
+    return None
 
 
 async def createPost(
     prompt: PromptTemplate,
     output_parser: StructuredOutputParser,
     text: str,
+    links: List[str] = None,
     image_url: str = None,
 ):
     _input = prompt.format_prompt(information=text)
@@ -72,6 +111,7 @@ async def createPost(
         "description": description,
         "imageUrl": image_url,
         "full_explanation": full_explanation,
+        "links": links,
     }
 
     # Make a POST request to the server
@@ -207,12 +247,14 @@ class ArxivPostCreator:
         summary = post_info["summary"]
         pdf_link = post_info["pdf_link"]
         text = f"{title}\n{summary}"
+        links = [pdf_link]
         if len(text) < 120:
             return None  # Skip processing if the content is too short
-        
 
-        image_url = None # await extract_square_image_from_pdf(pdf_link, 200)
-        response = await createPost(self.prompt, self.output_parser, text, image_url)
+        image_url = None  # await extract_square_image_from_pdf(pdf_link, 200)
+        response = await createPost(
+            self.prompt, self.output_parser, text, links, image_url
+        )
         if response.status_code == 200:
             self.processed_dois.add(doi)  # Mark the post as processed
             await self.save_processed_dois()  # Save the updated list of processed IDs
@@ -234,7 +276,7 @@ class HackerNewsPostCreator:
         self.output_dir = output_dir
         self.output_file = os.path.join(output_dir, "hackernews_used_ids.txt")
         self.processed_ids = set()
-        self.semaphore = asyncio.Semaphore(10)
+        self.semaphore = asyncio.Semaphore(5)
         response_schemas = [
             ResponseSchema(
                 name="full_explanation",
@@ -280,7 +322,7 @@ class HackerNewsPostCreator:
         with open(self.output_file, "w") as f:
             f.write("\n".join(map(str, self.processed_ids)))
 
-    async def parseSite(self, story_id: str):
+    async def parseSite(self, story_id: str) -> (str, str):
         if story_id in self.processed_ids:
             print("exists")
             return None  # Skip processing if the post has already been processed
@@ -296,28 +338,30 @@ class HackerNewsPostCreator:
         url = story_details.get("url")
         if not url or not title:
             return None
-        
-        text_contents = ""
-        
-        #! FIX FINISH
+
+        text_contents = None
+
         # if url is youtube get transcript
-        if url.contains("youtube.com") or url.contains("youtu.be"): # or some other one
+        if "youtube.com" in url or "youtu.be" in url:
             # extract it
-            text_contents = await asyncio.to_thread(get_youtube_transcript,url)
+            text_contents = await get_youtube_transcript(url)
         else:
             # grab a HTML file to extract data fro
             downloaded = fetch_url(url)
 
             # output main content and comments as plain text
             text_contents = extract(downloaded, include_comments=False)
-        
+
+        if not text_contents:
+            return None
+
         if len(text_contents) < 200:
             return None  # Skip processing if the content is too short
-        
+
         # Limit text_contents to a maximum of 10,000 characters
         text_contents = text_contents[:10000]
-        
-        return f"\nText:\n{title}\n{text_contents}"
+
+        return (f"\nText:\n{title}\n{text_contents}", url)
 
     async def process_post(
         self,
@@ -325,11 +369,17 @@ class HackerNewsPostCreator:
     ):
         async with self.semaphore:
             try:
-                text = await self.parseSite(story_id)
+                text, url = await self.parseSite(story_id)
                 if text is None:
                     return
+
+                image_url = await extract_best_image_from_page(url)
+                links = [url]
+
                 # Check the response
-                response = await createPost(self.prompt, self.output_parser, text)
+                response = await createPost(
+                    self.prompt, self.output_parser, text, links, image_url
+                )
                 if response.status_code == 200:
                     self.processed_ids.add(story_id)  # Mark the post as processed
                     await self.save_processed_ids()  # Save the updated list of processed IDs
@@ -371,8 +421,7 @@ if __name__ == "__main__":
 
     output_dir = "output"
     os.makedirs(output_dir, exist_ok=True)
-    # hacker_news_post_creator = HackerNewsPostCreator(output_dir)
-    arxiv_post_creator = ArxivPostCreator(output_dir)
+    hacker_news_post_creator = HackerNewsPostCreator(output_dir)
+    asyncio.run(hacker_news_post_creator.main())
 
-    # asyncio.run(hacker_news_post_creator.main())
-    asyncio.run(arxiv_post_creator.main())
+    # arxiv_post_creator = ArxivPostCreator(output_dir)

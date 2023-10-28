@@ -23,47 +23,13 @@ llm: LLM = G4FLLM(
     provider=Provider.FreeGpt,
 )
 
+async def get_youtube_transcript(video_url):
+    # extract youtube transcript from the video
+    
 
-async def extract_square_image_from_pdf(pdf_path, min_resolution):
-    doc = fitz.open(pdf_path)
-    square_image = None
-    min_diff = float("inf")
-    image_count = 0
-
-    for i in range(len(doc)):
-        for img in doc.get_page_images(i):
-            xref = img[0]
-            base_image = doc.extract_image(xref)
-            image_data = base_image["image"]
-
-            # Open the image using PIL
-            image = Image.open(io.BytesIO(image_data))
-
-            # Skip if the image is smaller than the minimum resolution
-            if image.width < min_resolution or image.height < min_resolution:
-                continue
-
-            # If the image is perfectly square, return it immediately
-            if image.width == image.height:
-                return image
-
-            # Calculate the difference between width and height
-            diff = abs(image.width - image.height)
-
-            # If this image is more square than the previous most square image,
-            # update min_diff and square_image
-            if diff < min_diff:
-                min_diff = diff
-                square_image = image
-
-            # Increment the count of checked images
-            image_count += 1
-
-            # If we've checked 10 images, return the most square one found so far
-            if image_count >= 10:
-                return square_image
-
-    return square_image
+#! FIX FINISH
+async def extract_best_image_from_page(page_url):
+    # somehow extract best image of the article or info from the page
 
 
 async def createPost(
@@ -164,11 +130,15 @@ class ArxivPostCreator:
         response_schemas = [
             ResponseSchema(
                 name="title",
-                description="Generate a precise title that captures the essence of the information in 1-4 keywords. Make it very short and understadable by broad audience ",
+                description="Generate a precise title that captures the essence of the information in keywords. Make it understadable by broad audience and very short. Can be as short as one word.",
             ),
             ResponseSchema(
                 name="description",
-                description="Elaborate on the title with a short one-sentence summary that provides new insights.",
+                description="Elaborate on the title with a short, one-sentence description.",
+            ),
+            ResponseSchema(
+                name="search_query",
+                description="Generate a search query for google images to find the most representative picture of the exact information.",
             ),
         ]
         self.output_parser = StructuredOutputParser.from_response_schemas(
@@ -237,8 +207,11 @@ class ArxivPostCreator:
         summary = post_info["summary"]
         pdf_link = post_info["pdf_link"]
         text = f"{title}\n{summary}"
+        if len(text) < 120:
+            return None  # Skip processing if the content is too short
+        
 
-        image_url = await extract_square_image_from_pdf(pdf_link, 200)
+        image_url = None # await extract_square_image_from_pdf(pdf_link, 200)
         response = await createPost(self.prompt, self.output_parser, text, image_url)
         if response.status_code == 200:
             self.processed_dois.add(doi)  # Mark the post as processed
@@ -265,15 +238,15 @@ class HackerNewsPostCreator:
         response_schemas = [
             ResponseSchema(
                 name="full_explanation",
-                description="Generate a detailed and long full explanation/summarization of the information",
+                description="Generate a detailed and full summarization of the information. Include as much detail as possible. This should be long and extensive. Try to structure it in paragraphs and can use markdown if needed.",
             ),
             ResponseSchema(
                 name="title",
-                description="Generate a precise title that captures the essence of the information in 1-3 keywords. Make it understadable by broad audience and very short",
+                description="Generate a precise title that captures the essence of the information in keywords. Make it understadable by broad audience and very short. Can be as short as one word.",
             ),
             ResponseSchema(
                 name="description",
-                description="Elaborate on the title with a short one-sentence summary that provides new insights.",
+                description="Elaborate on the title with a short, one-sentence description.",
             ),
             ResponseSchema(
                 name="search_query",
@@ -286,7 +259,7 @@ class HackerNewsPostCreator:
 
         format_instructions = self.output_parser.get_format_instructions()
         self.prompt = PromptTemplate(
-            template="Summarize the information in an unbiased manner. Write as if you're the author sharing this information.\n{format_instructions}\n{information}",
+            template="Summarize the information in an unbiased manner.\n{format_instructions}\n{information}",
             # include - to keep it understandable and not use complex words, and write as neutral as possible
             input_variables=["information"],
             partial_variables={"format_instructions": format_instructions},
@@ -323,22 +296,28 @@ class HackerNewsPostCreator:
         url = story_details.get("url")
         if not url or not title:
             return None
-
-        # grab a HTML file to extract data from
-        downloaded = fetch_url(url)
-
-        # output main content and comments as plain text
-        result = extract(downloaded, include_comments=False)
-
-        main_text = result
-
-        # Limit main_text to a maximum of 10,000 characters
-        main_text = main_text[:10000]
-
-        if len(main_text) < 200:
-            return None  # Skip processing if the content is too short
+        
+        text_contents = ""
+        
+        #! FIX FINISH
+        # if url is youtube get transcript
+        if url.contains("youtube.com") or url.contains("youtu.be"): # or some other one
+            # extract it
+            text_contents = await asyncio.to_thread(get_youtube_transcript,url)
         else:
-            return f"\nText:\n{title}\n{main_text}"
+            # grab a HTML file to extract data fro
+            downloaded = fetch_url(url)
+
+            # output main content and comments as plain text
+            text_contents = extract(downloaded, include_comments=False)
+        
+        if len(text_contents) < 200:
+            return None  # Skip processing if the content is too short
+        
+        # Limit text_contents to a maximum of 10,000 characters
+        text_contents = text_contents[:10000]
+        
+        return f"\nText:\n{title}\n{text_contents}"
 
     async def process_post(
         self,

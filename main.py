@@ -10,7 +10,6 @@ import asyncio
 import nest_asyncio
 from newspaper import Article
 from trafilatura import fetch_url, extract
-import xml.etree.ElementTree as ET
 import feedparser
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api.formatters import TextFormatter

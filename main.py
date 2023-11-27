@@ -76,7 +76,7 @@ async def get_youtube_transcript(video_url):
 
 
 def login(username, password):
-    url = "https://gateapi.vercel.app"
+    url = "https://gateapi.vercel.app/users/auth"
     payload = {
         "action": "login",
         "data": {"identifier": username, "password": password},
@@ -129,7 +129,9 @@ async def createPost(
 
         parsed_output = output_parser.parse(output)
     except Exception as e:
-        raise Exception("LLM Error: ", e)
+        err = f"LLM Error: {e}"
+
+        return (err, None, None)
 
     # Access the "title" and "description"
     title = parsed_output.get("title")
@@ -166,7 +168,7 @@ async def createPost(
             url + "/cells/create", headers=headers, json=payload
         ) as response:
             data = await response.json()
-            return (response, data)
+            return (None, response, data)
 
 
 async def fetch_google_image(query: str):
@@ -301,9 +303,11 @@ class ArxivPostCreator:
                 return None  # Skip processing if the content is too short
 
             image_url = None  # await extract_square_image_from_pdf(pdf_link, 200)
-            response, data = await createPost(
+            err, response, data = await createPost(
                 self.prompt, self.output_parser, text, self.token, links, image_url
             )
+            if err:
+                return
             if response.status == 200:
                 self.processed_dois.add(doi)  # Mark the post as processed
                 await self.save_processed_dois()  # Save the updated list of processed IDs
@@ -331,7 +335,7 @@ class HackerNewsPostCreator:
         response_schemas = [
             ResponseSchema(
                 name="full_explanation",
-                description="Generate a detailed and full summarization of the information. Include as much detail as possible. This should be long and extensive. Structure it in paragraphs and include all information possible.",
+                description="Generate a detailed and full summarization of the information. This should be long and extensive. Structure it in paragraphs and include all information possible. ",
             ),
             ResponseSchema(
                 name="title",
@@ -374,10 +378,6 @@ class HackerNewsPostCreator:
             f.write("\n".join(map(str, self.processed_ids)))
 
     async def parseSite(self, story_id: str) -> (str, str):
-        if story_id in self.processed_ids:
-            print("exists")
-            return None, None  # Skip processing if the post has already been processed
-
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 f"https://hacker-news.firebaseio.com/v0/item/{story_id}.json?print=pretty"
@@ -446,9 +446,11 @@ class HackerNewsPostCreator:
                 links = [url]
 
                 # Check the response
-                response, data = await createPost(
+                err, response, data = await createPost(
                     self.prompt, self.output_parser, text, self.token, links, image_url
                 )
+                if err:
+                    return
                 if response.status == 200:
                     self.processed_ids.add(story_id)  # Mark the post as processed
                     await self.save_processed_ids()  # Save the updated list of processed IDs
@@ -476,7 +478,14 @@ class HackerNewsPostCreator:
         # merge and remove duplicates
         # top and best stories combined
         story_ids = list(set(story_ids1 + story_ids2))
-        # print(story_ids)
+
+        # Filter out story IDs that have already been processed
+        story_ids = [
+            story_id for story_id in story_ids if story_id not in self.processed_ids
+        ]
+
+        # Limit to 40 posts per time
+        story_ids = story_ids[:40]
 
         # Create tasks to fetch details for each story concurrently
         tasks = [self.process_post(str(story_id)) for story_id in story_ids]
@@ -496,7 +505,7 @@ if __name__ == "__main__":
     hacker_news_post_creator = HackerNewsPostCreator(output_dir, 5)
     # arxiv_post_creator = ArxivPostCreator(output_dir)
 
-    # fetch and post every 4 hours
+    # fetch and post every 3 hours
     while True:
         asyncio.run(hacker_news_post_creator.run())
-        time.sleep(3600 * 4)
+        time.sleep(3600 * 3)

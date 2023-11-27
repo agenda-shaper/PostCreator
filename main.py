@@ -5,7 +5,6 @@ from langchain.output_parsers import StructuredOutputParser, ResponseSchema
 from langchain.prompts import PromptTemplate
 import os
 import json
-import requests
 import asyncio
 import nest_asyncio
 from newspaper import Article
@@ -16,13 +15,38 @@ from youtube_transcript_api.formatters import TextFormatter
 from newspaper import Article
 import re
 from typing import List  # Import the List type hint
+import base64
+import time
+import aiohttp
+import requests
 
 nest_asyncio.apply()
+
 # Set up the LLM model
 llm: LLM = G4FLLM(
     model=models.gpt_35_turbo,
     provider=Provider.GeekGpt,
 )
+
+
+async def upload_image(image_base64):
+    url = "https://api.imgbb.com/1/upload?key=c16460ec60fe42c07eb757018ea9e5dd"
+    payload = {"image": image_base64}
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, data=payload) as res:
+            if res.status != 200:
+                raise Exception(
+                    "Failed to upload image. Status code: " + str(res.status)
+                )
+
+            data = await res.json()
+
+            if data["success"]:
+                return data["data"]["url"]
+            else:
+                print("Error uploading image:", data)
+                return None
 
 
 def extract_youtube_video_id(url):
@@ -51,6 +75,23 @@ async def get_youtube_transcript(video_url):
     return plain_text
 
 
+def login(username, password):
+    url = "https://gateapi.vercel.app"
+    payload = {
+        "action": "login",
+        "data": {"identifier": username, "password": password},
+    }
+
+    response = requests.post(url, json=payload)
+    data = response.json()
+    if response.status_code == 200:
+        token = data["token"]
+        with open("token.txt", "w") as f:
+            f.write(token)
+    else:
+        print(f"{response.status_code} Server error:", data)
+
+
 async def extract_best_image_from_page(page_url):
     try:
         article = Article(page_url)
@@ -73,17 +114,22 @@ async def createPost(
     prompt: PromptTemplate,
     output_parser: StructuredOutputParser,
     text: str,
+    token: str,
     links: List[str] = None,
     image_url: str = None,
 ):
-    _input = prompt.format_prompt(information=text)
-    # print(_input.to_string())
-    print(len(_input.to_string()))
+    # later rotate LLMs to always use working one
+    try:
+        _input = prompt.format_prompt(information=text)
+        # print(_input.to_string())
+        print(len(_input.to_string()))
 
-    output = llm(_input.to_string())
-    print(output)
+        output = llm(_input.to_string())
+        print(output)
 
-    parsed_output = output_parser.parse(output)
+        parsed_output = output_parser.parse(output)
+    except Exception as e:
+        raise Exception("LLM Error: ", e)
 
     # Access the "title" and "description"
     title = parsed_output.get("title")
@@ -102,7 +148,7 @@ async def createPost(
     # print("Full Explanation:", full_explanation)
 
     # Define the URL of your server
-    url = "https://nodejs-serverless-function-express-snowy-eight.vercel.app"  # Replace with the actual URL
+    url = "https://gateapi.vercel.app"  # Replace with the actual URL
 
     # Define the request payload (body)
     payload = {
@@ -113,11 +159,14 @@ async def createPost(
         "links": links,
     }
 
-    # Make a POST request to the server
-    response = await asyncio.to_thread(
-        requests.post, url + "/cells/create", json=payload
-    )
-    return response
+    headers = {"Authorization": token}
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            url + "/cells/create", headers=headers, json=payload
+        ) as response:
+            data = await response.json()
+            return (response, data)
 
 
 async def fetch_google_image(query: str):
@@ -134,38 +183,36 @@ async def fetch_google_image(query: str):
         "num": 10,  # The number of images to return
     }
 
-    # Send the GET request
-    response = await asyncio.to_thread(requests.get, endpoint, params=params)
-
-    # Get the JSON response
-    json_response = response.json()
-
     # Initialize min_diff with a large value
     min_diff = float("inf")
     square_image_link = None
 
-    # Iterate over the image results
-    for image_result in json_response["items"]:
-        width = image_result["image"]["width"]
-        height = image_result["image"]["height"]
+    async with aiohttp.ClientSession() as session:
+        async with session.get(endpoint, params=params) as response:
+            json_response = await response.json()
 
-        # Calculate the difference between width and height
-        diff = abs(width - height)
+            # Iterate over the image results
+            for image_result in json_response["items"]:
+                width = image_result["image"]["width"]
+                height = image_result["image"]["height"]
+                diff = abs(width - height)
 
-        # If this image is more square than the previous most square image,
-        # update min_diff and square_image_link
-        if diff < min_diff:
-            min_diff = diff
-            square_image_link = image_result["link"]
+                if diff < min_diff:
+                    min_diff = diff
+                    square_image_link = image_result["link"]
 
     return square_image_link
 
 
 class ArxivPostCreator:
-    def __init__(self, output_dir="output"):
+    def __init__(self, output_dir="output", semaphores=5):
         self.output_dir = output_dir
         self.output_file = os.path.join(output_dir, "arxiv_used_dois.txt")
         self.processed_dois = set()
+        self.semaphore = asyncio.Semaphore(semaphores)
+        with open("token.txt", "r") as f:
+            self.token = f.read()
+
         response_schemas = [
             ResponseSchema(
                 name="title",
@@ -208,60 +255,63 @@ class ArxivPostCreator:
     async def fetch_arxiv_data(self, category, search_query, start=0, max_results=10):
         url = f"http://export.arxiv.org/api/query?search_query={category}:{search_query}&start={start}&max_results={max_results}"
 
-        response = requests.get(url)
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                response.raise_for_status()
+                feed_content = await response.text()
 
-        if response.status_code == 200:
-            feed = feedparser.parse(response.content)
+        feed = feedparser.parse(feed_content)
 
-            processed = []
+        processed = []
 
-            for entry in feed.entries:
-                doi = entry.get("id", None)
-                if doi and doi not in self.processed_dois:
-                    title = entry.get("title", "")
-                    summary = entry.get("summary", "")
+        for entry in feed.entries:
+            doi = entry.get("id", None)
+            if doi and doi not in self.processed_dois:
+                title = entry.get("title", "")
+                summary = entry.get("summary", "")
 
-                    # Get the link to the PDF
-                    pdf_link = ""
-                    for link in entry.get("links", []):
-                        if link.get("type") == "application/pdf":
-                            pdf_link = link.get("href")
-                            break
+                # Get the link to the PDF
+                pdf_link = ""
+                for link in entry.get("links", []):
+                    if link.get("type") == "application/pdf":
+                        pdf_link = link.get("href")
+                        break
 
-                    # Store the information in a dictionary
-                    post_info = {
-                        "doi": doi,
-                        "title": title,
-                        "summary": summary,
-                        "pdf_link": pdf_link,
-                    }
-                    print(post_info)
+                # Store the information in a dictionary
+                post_info = {
+                    "doi": doi,
+                    "title": title,
+                    "summary": summary,
+                    "pdf_link": pdf_link,
+                }
+                print(post_info)
 
-                    processed.append(post_info)
-            return processed
+                processed.append(post_info)
+        return processed
 
     async def process_arxiv_post(self, post_info):
-        doi = post_info["doi"]
-        title = post_info["title"]
-        summary = post_info["summary"]
-        pdf_link = post_info["pdf_link"]
-        text = f"{title}\n{summary}"
-        links = [pdf_link]
-        if len(text) < 120:
-            return None  # Skip processing if the content is too short
+        async with self.semaphore:
+            doi = post_info["doi"]
+            title = post_info["title"]
+            summary = post_info["summary"]
+            pdf_link = post_info["pdf_link"]
+            text = f"{title}\n{summary}"
+            links = [pdf_link]
+            if len(text) < 120:
+                return None  # Skip processing if the content is too short
 
-        image_url = None  # await extract_square_image_from_pdf(pdf_link, 200)
-        response = await createPost(
-            self.prompt, self.output_parser, text, links, image_url
-        )
-        if response.status_code == 200:
-            self.processed_dois.add(doi)  # Mark the post as processed
-            await self.save_processed_dois()  # Save the updated list of processed IDs
-            print("Success:", response.json())
-        else:
-            print(f"{response.status_code} Server error:", response.json())
+            image_url = None  # await extract_square_image_from_pdf(pdf_link, 200)
+            response, data = await createPost(
+                self.prompt, self.output_parser, text, self.token, links, image_url
+            )
+            if response.status == 200:
+                self.processed_dois.add(doi)  # Mark the post as processed
+                await self.save_processed_dois()  # Save the updated list of processed IDs
+                print("Success:", data)
+            else:
+                print(f"{response.status} Server error:", data)
 
-    async def main(self):
+    async def run(self):
         await self.load_processed_dois()
         posts = await self.fetch_arxiv_data("all", "machine learning", 0, 10)
 
@@ -271,15 +321,17 @@ class ArxivPostCreator:
 
 
 class HackerNewsPostCreator:
-    def __init__(self, output_dir="output"):
+    def __init__(self, output_dir="output", semaphores=5):
         self.output_dir = output_dir
         self.output_file = os.path.join(output_dir, "hackernews_used_ids.txt")
         self.processed_ids = set()
-        self.semaphore = asyncio.Semaphore(5)
+        with open("token.txt", "r") as f:
+            self.token = f.read()
+        self.semaphore = asyncio.Semaphore(semaphores)
         response_schemas = [
             ResponseSchema(
                 name="full_explanation",
-                description="Generate a detailed and full summarization of the information. Include as much detail as possible. This should be long and extensive. Try to structure it in paragraphs and can use markdown if needed.",
+                description="Generate a detailed and full summarization of the information. Include as much detail as possible. This should be long and extensive. Structure it in paragraphs and include all information possible.",
             ),
             ResponseSchema(
                 name="title",
@@ -324,19 +376,20 @@ class HackerNewsPostCreator:
     async def parseSite(self, story_id: str) -> (str, str):
         if story_id in self.processed_ids:
             print("exists")
-            return None  # Skip processing if the post has already been processed
+            return None, None  # Skip processing if the post has already been processed
 
-        item_response = await asyncio.to_thread(
-            requests.get,
-            f"https://hacker-news.firebaseio.com/v0/item/{story_id}.json?print=pretty",
-        )
-        item_response.raise_for_status()
-        story_details = json.loads(item_response.text)
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"https://hacker-news.firebaseio.com/v0/item/{story_id}.json?print=pretty"
+            ) as response:
+                response.raise_for_status()
+                story_details = await response.json()
         # print(story_details)
         title = story_details.get("title")
         url = story_details.get("url")
         if not url or not title:
-            return None
+            print("hacker news has no title or url")
+            return None, None
 
         text_contents = None
 
@@ -352,13 +405,15 @@ class HackerNewsPostCreator:
             text_contents = extract(downloaded, include_comments=False)
 
         if not text_contents:
-            return None
+            print("no text")
+            return None, None
 
         if len(text_contents) < 200:
-            return None  # Skip processing if the content is too short
+            print("too short")
+            return None, None  # Skip processing if the content is too short
 
-        # Limit text_contents to a maximum of 10,000 characters
-        text_contents = text_contents[:10000]
+        # Limit text_contents to a maximum of 12,000 characters
+        text_contents = text_contents[:12000]
 
         return (f"\nText:\n{title}\n{text_contents}", url)
 
@@ -372,39 +427,55 @@ class HackerNewsPostCreator:
                 if text is None:
                     return
 
-                image_url = await extract_best_image_from_page(url)
+                image_url = None
+
+                extracted_image_url = await extract_best_image_from_page(url)
+                try:
+                    # Convert the image to base64
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(extracted_image_url) as response:
+                            image_content = await response.read()
+                            image_base64 = base64.b64encode(image_content).decode(
+                                "utf-8"
+                            )
+
+                    if image_base64:
+                        image_url = await upload_image(image_base64)
+                except:
+                    image_url = None
                 links = [url]
 
                 # Check the response
-                response = await createPost(
-                    self.prompt, self.output_parser, text, links, image_url
+                response, data = await createPost(
+                    self.prompt, self.output_parser, text, self.token, links, image_url
                 )
-                if response.status_code == 200:
+                if response.status == 200:
                     self.processed_ids.add(story_id)  # Mark the post as processed
                     await self.save_processed_ids()  # Save the updated list of processed IDs
-                    print("Success:", response.json())
+                    print("Success:", data)
                 else:
-                    print(f"{response.status_code} Server error:", response.json())
+                    print(f"{response.status} Server error:", data)
             except Exception as e:
-                print(f"Error processing post {story_id}: {str(e)}")
+                raise Exception(f"Error processing post {story_id}: {str(e)}")
 
-    async def main(self):
+    async def run(self):
         await self.load_processed_ids()
 
-        response = await asyncio.to_thread(
-            requests.get,
-            "https://hacker-news.firebaseio.com/v0/topstories.json?print=pretty",
-        )
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://hacker-news.firebaseio.com/v0/topstories.json?print=pretty"
+            ) as response:
+                response.raise_for_status()
+                story_ids1 = await response.json()
 
-        response.raise_for_status()  # Raise an exception for 4xx and 5xx status codes
-        response2 = await asyncio.to_thread(
-            requests.get,
-            "https://hacker-news.firebaseio.com/v0/beststories.json?print=pretty",
-        )
-        response2.raise_for_status()
+            async with session.get(
+                "https://hacker-news.firebaseio.com/v0/beststories.json?print=pretty"
+            ) as response:
+                response.raise_for_status()
+                story_ids2 = await response.json()
         # merge and remove duplicates
         # top and best stories combined
-        story_ids = list(set(eval(response.text) + eval(response2.text)))
+        story_ids = list(set(story_ids1 + story_ids2))
         # print(story_ids)
 
         # Create tasks to fetch details for each story concurrently
@@ -415,12 +486,17 @@ class HackerNewsPostCreator:
 
 
 if __name__ == "__main__":
-    # You can now work with the categorized_posts list as needed
-    # It contains dictionaries with "Title" and "Category" keys for each post
-
     output_dir = "output"
     os.makedirs(output_dir, exist_ok=True)
-    hacker_news_post_creator = HackerNewsPostCreator(output_dir)
-    asyncio.run(hacker_news_post_creator.main())
 
+    username = "PostCreator"
+    password = "passwordJohnCena55524"
+    login(username, password)
+
+    hacker_news_post_creator = HackerNewsPostCreator(output_dir, 5)
     # arxiv_post_creator = ArxivPostCreator(output_dir)
+
+    # fetch and post every 4 hours
+    while True:
+        asyncio.run(hacker_news_post_creator.run())
+        time.sleep(3600 * 4)

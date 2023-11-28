@@ -29,24 +29,33 @@ llm: LLM = G4FLLM(
 )
 
 
-async def upload_image(image_base64):
-    url = "https://api.imgbb.com/1/upload?key=c16460ec60fe42c07eb757018ea9e5dd"
-    payload = {"image": image_base64}
-
+async def upload_image(extracted_image_url):
+    # Convert the image to base64
     async with aiohttp.ClientSession() as session:
-        async with session.post(url, data=payload) as res:
-            if res.status != 200:
-                raise Exception(
-                    "Failed to upload image. Status code: " + str(res.status)
-                )
+        async with session.get(extracted_image_url) as response:
+            image_content = await response.read()
+            image_base64 = base64.b64encode(image_content).decode("utf-8")
 
-            data = await res.json()
+    if image_base64:
+        url = "https://api.imgbb.com/1/upload?key=c16460ec60fe42c07eb757018ea9e5dd"
+        payload = {"image": image_base64}
 
-            if data["success"]:
-                return data["data"]["url"]
-            else:
-                print("Error uploading image:", data)
-                return None
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, data=payload) as res:
+                if res.status != 200:
+                    raise Exception(
+                        "Failed to upload image. Status code: " + str(res.status)
+                    )
+
+                data = await res.json()
+
+                if data["success"]:
+                    return data["data"]["url"]
+                else:
+                    print("Error uploading image:", data)
+                    return None
+    else:
+        return None
 
 
 def extract_youtube_video_id(url):
@@ -141,7 +150,8 @@ async def createPost(
     if image_url is None:
         search_query = parsed_output.get("search_query")
         # fetch image from google
-        image_url = await fetch_google_image(search_query)
+        google_image_url = await fetch_google_image(search_query)
+        image_url = await upload_image(google_image_url)
         print("Search Query:", search_query)
 
     print("Title:", title)
@@ -431,16 +441,7 @@ class HackerNewsPostCreator:
 
                 extracted_image_url = await extract_best_image_from_page(url)
                 try:
-                    # Convert the image to base64
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(extracted_image_url) as response:
-                            image_content = await response.read()
-                            image_base64 = base64.b64encode(image_content).decode(
-                                "utf-8"
-                            )
-
-                    if image_base64:
-                        image_url = await upload_image(image_base64)
+                    image_url = await upload_image(extracted_image_url)
                 except:
                     image_url = None
                 links = [url]

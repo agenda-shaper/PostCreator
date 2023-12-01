@@ -283,7 +283,7 @@ class HackerNewsPostCreator:
         # print(story_details)
         title = story_details.get("title")
         url = story_details.get("url")
-        print(url, title)
+
         if not url or not title:
             print("hacker news has no title or url")
             return None, None
@@ -295,7 +295,7 @@ class HackerNewsPostCreator:
         if story_id in self.processed_ids:
             print("story_id exists")
             return None, None
-
+        print(url, title)
         text_contents = None
 
         # if url is youtube get transcript

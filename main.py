@@ -30,31 +30,34 @@ llm: LLM = G4FLLM(
 
 
 async def upload_image(extracted_image_url):
-    # Convert the image to base64
-    async with aiohttp.ClientSession() as session:
-        async with session.get(extracted_image_url) as response:
-            image_content = await response.read()
-            image_base64 = base64.b64encode(image_content).decode("utf-8")
-
-    if image_base64:
-        url = "https://api.imgbb.com/1/upload?key=c16460ec60fe42c07eb757018ea9e5dd"
-        payload = {"image": image_base64}
-
+    try:
+        # Convert the image to base64
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, data=payload) as res:
-                if res.status != 200:
-                    raise Exception(
-                        "Failed to upload image. Status code: " + str(res.status)
-                    )
+            async with session.get(extracted_image_url) as response:
+                image_content = await response.read()
+                image_base64 = base64.b64encode(image_content).decode("utf-8")
 
-                data = await res.json()
+        if image_base64:
+            url = "https://api.imgbb.com/1/upload?key=c16460ec60fe42c07eb757018ea9e5dd"
+            payload = {"image": image_base64}
 
-                if data["success"]:
-                    return data["data"]["url"]
-                else:
-                    print("Error uploading image:", data)
-                    return None
-    else:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, data=payload) as res:
+                    if res.status != 200:
+                        raise Exception(
+                            "Failed to upload image. Status code: " + str(res.status)
+                        )
+
+                    data = await res.json()
+
+                    if data["success"]:
+                        return data["data"]["url"]
+                    else:
+                        print("Error uploading image:", data)
+                        return None
+        else:
+            return None
+    except:
         return None
 
 
@@ -216,129 +219,13 @@ async def fetch_google_image(query: str):
     return square_image_link
 
 
-class ArxivPostCreator:
-    def __init__(self, output_dir="output", semaphores=5):
-        self.output_dir = output_dir
-        self.output_file = os.path.join(output_dir, "arxiv_used_dois.txt")
-        self.processed_dois = set()
-        self.semaphore = asyncio.Semaphore(semaphores)
-        with open("token.txt", "r") as f:
-            self.token = f.read()
-
-        response_schemas = [
-            ResponseSchema(
-                name="title",
-                description="Generate a precise title that captures the essence of the information in keywords. Make it understadable by broad audience and very short. Can be as short as one word.",
-            ),
-            ResponseSchema(
-                name="description",
-                description="Elaborate on the title with a short, one-sentence description.",
-            ),
-            ResponseSchema(
-                name="search_query",
-                description="Generate a search query for google images to find the most representative picture of the exact information.",
-            ),
-        ]
-        self.output_parser = StructuredOutputParser.from_response_schemas(
-            response_schemas
-        )
-
-        format_instructions = self.output_parser.get_format_instructions()
-        self.prompt = PromptTemplate(
-            template="Summary should be in an unbiased manner. Create an understandable title and short description of the information\n{format_instructions}\n{information}",
-            # include - to keep it understandable and not use complex words, and write as neutral as possible
-            input_variables=["information"],
-            partial_variables={"format_instructions": format_instructions},
-        )
-
-    async def load_processed_dois(self):
-        if not os.path.exists(self.output_file):
-            # Create the file if it doesn't exist
-            with open(self.output_file, "w"):
-                pass
-        with open(self.output_file, "r") as f:
-            lines = f.read().splitlines()
-            self.processed_dois.update(map(str, lines))
-
-    async def save_processed_dois(self):
-        with open(self.output_file, "w") as f:
-            f.write("\n".join(map(str, self.processed_dois)))
-
-    async def fetch_arxiv_data(self, category, search_query, start=0, max_results=10):
-        url = f"http://export.arxiv.org/api/query?search_query={category}:{search_query}&start={start}&max_results={max_results}"
-
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                response.raise_for_status()
-                feed_content = await response.text()
-
-        feed = feedparser.parse(feed_content)
-
-        processed = []
-
-        for entry in feed.entries:
-            doi = entry.get("id", None)
-            if doi and doi not in self.processed_dois:
-                title = entry.get("title", "")
-                summary = entry.get("summary", "")
-
-                # Get the link to the PDF
-                pdf_link = ""
-                for link in entry.get("links", []):
-                    if link.get("type") == "application/pdf":
-                        pdf_link = link.get("href")
-                        break
-
-                # Store the information in a dictionary
-                post_info = {
-                    "doi": doi,
-                    "title": title,
-                    "summary": summary,
-                    "pdf_link": pdf_link,
-                }
-                print(post_info)
-
-                processed.append(post_info)
-        return processed
-
-    async def process_arxiv_post(self, post_info):
-        async with self.semaphore:
-            doi = post_info["doi"]
-            title = post_info["title"]
-            summary = post_info["summary"]
-            pdf_link = post_info["pdf_link"]
-            text = f"{title}\n{summary}"
-            links = [pdf_link]
-            if len(text) < 120:
-                return None  # Skip processing if the content is too short
-
-            image_url = None  # await extract_square_image_from_pdf(pdf_link, 200)
-            err, response, data = await createPost(
-                self.prompt, self.output_parser, text, self.token, links, image_url
-            )
-            if err:
-                return
-            if response.status == 200:
-                self.processed_dois.add(doi)  # Mark the post as processed
-                await self.save_processed_dois()  # Save the updated list of processed IDs
-                print("Success:", data)
-            else:
-                print(f"{response.status} Server error:", data)
-
-    async def run(self):
-        await self.load_processed_dois()
-        posts = await self.fetch_arxiv_data("all", "machine learning", 0, 10)
-
-        # Create tasks to fetch details for each story concurrently
-        tasks = [self.process_arxiv_post(post_info) for post_info in posts]
-        await asyncio.gather(*tasks)
-
-
 class HackerNewsPostCreator:
     def __init__(self, output_dir="output", semaphores=5):
         self.output_dir = output_dir
-        self.output_file = os.path.join(output_dir, "hackernews_used_ids.txt")
+        self.output_file_ids = os.path.join(output_dir, "hackernews_used_ids.txt")
+        self.output_file_urls = os.path.join(output_dir, "hackernews_used_urls.txt")
         self.processed_ids = set()
+        self.processed_urls = set()
         with open("token.txt", "r") as f:
             self.token = f.read()
         self.semaphore = asyncio.Semaphore(semaphores)
@@ -373,19 +260,18 @@ class HackerNewsPostCreator:
         )
 
     async def load_processed_ids(self):
-        if not os.path.exists(self.output_file):
-            # Create the file if it doesn't exist
-            with open(self.output_file, "w") as f:
-                pass
-        with open(self.output_file, "r") as f:
-            lines = f.read().splitlines()
-            self.processed_ids.update(
-                map(str, lines)
-            )  # Convert loaded values to strings
+        if os.path.exists(self.output_file_ids):
+            with open(self.output_file_ids, "r") as f:
+                self.processed_ids = set(f.read().splitlines())
+        if os.path.exists(self.output_file_urls):
+            with open(self.output_file_urls, "r") as f:
+                self.processed_urls = set(f.read().splitlines())
 
     async def save_processed_ids(self):
-        with open(self.output_file, "w") as f:
-            f.write("\n".join(map(str, self.processed_ids)))
+        with open(self.output_file_ids, "w") as f:
+            f.write("\n".join(self.processed_ids))
+        with open(self.output_file_urls, "w") as f:
+            f.write("\n".join(self.processed_urls))
 
     async def parseSite(self, story_id: str) -> (str, str):
         async with aiohttp.ClientSession() as session:
@@ -397,8 +283,17 @@ class HackerNewsPostCreator:
         # print(story_details)
         title = story_details.get("title")
         url = story_details.get("url")
+        print(url, title)
         if not url or not title:
             print("hacker news has no title or url")
+            return None, None
+
+        if url in self.processed_urls:
+            print("url exists")
+            return None, None
+
+        if story_id in self.processed_ids:
+            print("story_id exists")
             return None, None
 
         text_contents = None
@@ -434,7 +329,8 @@ class HackerNewsPostCreator:
         async with self.semaphore:
             try:
                 text, url = await self.parseSite(story_id)
-                if text is None:
+
+                if text is None or url is None:
                     return
 
                 image_url = None
@@ -453,8 +349,9 @@ class HackerNewsPostCreator:
                 if err:
                     return
                 if response.status == 200:
-                    self.processed_ids.add(story_id)  # Mark the post as processed
-                    await self.save_processed_ids()  # Save the updated list of processed IDs
+                    self.processed_ids.add(story_id)
+                    self.processed_urls.add(url)
+                    await self.save_processed_ids()
                     print("Success:", data)
                 else:
                     print(f"{response.status} Server error:", data)
@@ -493,6 +390,7 @@ class HackerNewsPostCreator:
 
         # Run the tasks concurrently
         await asyncio.gather(*tasks)
+        print("finished")
 
 
 if __name__ == "__main__":
@@ -506,7 +404,7 @@ if __name__ == "__main__":
     hacker_news_post_creator = HackerNewsPostCreator(output_dir, 5)
     # arxiv_post_creator = ArxivPostCreator(output_dir)
 
-    # fetch and post every 3 hours
+    # fetch and post every 4 hours
     while True:
         asyncio.run(hacker_news_post_creator.run())
-        time.sleep(3600 * 3)
+        time.sleep(3600 * 4)

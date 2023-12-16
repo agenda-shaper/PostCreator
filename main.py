@@ -25,7 +25,7 @@ nest_asyncio.apply()
 # Set up the LLM model
 llm: LLM = G4FLLM(
     model=models.gpt_35_turbo,
-    provider=Provider.GeekGpt,
+    provider=Provider.AiAsk,
 )
 
 
@@ -331,6 +331,8 @@ class HackerNewsPostCreator:
                 text, url = await self.parseSite(story_id)
 
                 if text is None or url is None:
+                    return
+                if len(text) < 20:
                     return
 
                 image_url = None

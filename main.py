@@ -25,7 +25,7 @@ nest_asyncio.apply()
 # Set up the LLM model
 llm: LLM = G4FLLM(
     model=models.gpt_35_turbo,
-    provider=Provider.AiAsk,
+    provider=Provider.ChatBase,
 )
 
 
@@ -147,6 +147,8 @@ async def createPost(
 
     # Access the "title" and "description"
     title = parsed_output.get("title")
+    if "chatbase" in title.lower():
+        return ("Chatbase in title", None, None)
     description = parsed_output.get("description")
     full_explanation = parsed_output.get("full_explanation")
 
